@@ -1,0 +1,17 @@
+data_path: "/home/akhtyamov/datasets/ImageNet2012__wan-mil-split-attn-12to4-stage3__resolution_256"
+results_dir: "dit-updates/dit-ddpm-xl-2-256__imagenet2012__wan-mil-split-attn-12to4-stage3"
+vae: wan-mil-split-attn-12to4-stage3
+model: DiT-XL/2
+image_size: 256
+num_classes: 1000
+epochs: 300
+global_batch_size: 512
+global_seed: 0
+num_workers: 8
+log_every: 100
+ckpt_every: 25000
+sample_every: 5
+cfg_scale: 4.0
+num_sampling_steps: 250
+
+objective: ddpm
