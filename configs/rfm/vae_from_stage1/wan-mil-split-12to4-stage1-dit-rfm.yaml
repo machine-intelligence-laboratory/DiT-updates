@@ -1,0 +1,25 @@
+data_path: "Latents from wan-mil-split-12to4"
+results_dir: "dit-updates/dit-rfm-xl-2-256__imagenet2012__wan-mil-split-12to4-stage1"
+
+vae: wan-mil-split-12to4
+model: DiT-XL/2
+image_size: 256
+num_classes: 1000
+epochs: 100
+global_batch_size: 512
+global_seed: 0
+num_workers: 8
+log_every: 100
+ckpt_every: 10000
+sample_every: 5
+cfg_scale: 4.0
+num_sampling_steps: 100 # 250
+
+objective: rfm
+rfm:
+  time_shift: 3.0
+  time_emb_scale: 6.28
+  num_val_steps: 100
+  base_sampler: "logit-normal"
+  sigma_time_dist: 1.0
+  pred_mode: "flow"
