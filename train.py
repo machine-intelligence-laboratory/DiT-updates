@@ -83,6 +83,62 @@ def cleanup():
     dist.destroy_process_group()
 
 
+def _checkpoint_step_from_name(ckpt_path):
+    """Best-effort parse of the training step from a checkpoint filename (e.g. '0010000.pt')."""
+    try:
+        return int(Path(ckpt_path).stem)
+    except ValueError:
+        return -1
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    """Return the path of the most relevant checkpoint in a directory.
+
+    Prefers an overwritable 'last.pt'; otherwise the highest-numbered '*.pt'
+    file. Returns None if no checkpoint is available.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    last_path = os.path.join(checkpoint_dir, "last.pt")
+    if os.path.isfile(last_path):
+        return last_path
+    ckpts = [c for c in glob(os.path.join(checkpoint_dir, "*.pt"))
+             if Path(c).stem != "last"]
+    if not ckpts:
+        return None
+    return max(ckpts, key=_checkpoint_step_from_name)
+
+
+def load_checkpoint(model, ema, opt, ckpt_path, device, logger):
+    """Load model/ema/opt state from a checkpoint.
+
+    Returns (train_steps, epoch) to resume from. `epoch` is the epoch index that
+    was in progress when the checkpoint was written, so the loop restarts there.
+    """
+    logger.info(f"Loading checkpoint from {ckpt_path}")
+    # `device` may be a bare int (cuda index); torch.load expects a torch.device/string/callable.
+    map_location = device if isinstance(device, torch.device) else torch.device(device)
+    checkpoint = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+    model.module.load_state_dict(checkpoint["model"])
+    ema.load_state_dict(checkpoint["ema"])
+    opt.load_state_dict(checkpoint["opt"])
+    train_steps = checkpoint.get("step", None)
+    if train_steps is None:
+        train_steps = _checkpoint_step_from_name(ckpt_path)
+        if train_steps < 0:
+            train_steps = 0
+            logger.info("Loaded checkpoint, but couldn't determine step count; resuming from step 0.")
+        else:
+            logger.info(f"Loaded checkpoint. Resuming from step {train_steps}.")
+    else:
+        logger.info(f"Loaded checkpoint. Resuming from step {train_steps}.")
+    epoch = checkpoint.get("epoch", 0)
+    if epoch is None:
+        epoch = 0
+    logger.info(f"Resuming from epoch {epoch}.")
+    return int(train_steps), int(epoch)
+
+
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
@@ -165,20 +221,33 @@ def main(args):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
-    # Setup an experiment folder:
+    # Setup the experiment folder (results_dir is used directly; no indexed subfolder):
+    resume_ckpt_path = None
     if rank == 0:
         results_dir = str(resolve_path(args.results_dir, "experiment"))
-        os.makedirs(results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        experiment_index = len(glob(f"{results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        os.makedirs(results_dir, exist_ok=True)
+        checkpoint_dir = f"{results_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        shutil.copy2(args.config_path, f"{experiment_dir}/config.yaml")
-        logger = create_logger(experiment_dir)
-        logger.info(f"Experiment directory created at {experiment_dir}")
+
+        if getattr(args, "auto_resume", True):
+            # By default, resume from the latest checkpoint in this folder (preferring 'last.pt').
+            resume_ckpt_path = find_latest_checkpoint(checkpoint_dir)
+
+        shutil.copy2(args.config_path, f"{results_dir}/config.yaml")
+        logger = create_logger(results_dir)
+        logger.info(f"Experiment directory: {results_dir}")
+        if resume_ckpt_path:
+            logger.info(f"Resuming training from checkpoint: {resume_ckpt_path}")
+        else:
+            logger.info("Starting training from scratch.")
     else:
         logger = create_logger(None)
+
+    # Broadcast the resume checkpoint path from rank 0 to all ranks so every
+    # process loads the same weights when auto-resuming.
+    obj = [resume_ckpt_path]
+    dist.broadcast_object_list(obj, src=0)
+    resume_ckpt_path = obj[0]
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -217,34 +286,17 @@ def main(args):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
     # ==========================================
-    # NEW: CHECKPOINT LOADING LOGIC
+    # CHECKPOINT LOADING LOGIC
     # ==========================================
     train_steps = 0
-    if hasattr(args, "pretrained_path") and args.pretrained_path:
-        if os.path.isfile(args.pretrained_path):
-            logger.info(f"Loading checkpoint from {args.pretrained_path}")
-            # Map weights to the correct device for this specific DDP process
-            checkpoint = torch.load(args.pretrained_path, map_location=device)
-            
-            # The saved checkpoint uses model.module.state_dict(), so we load into model.module
-            model.module.load_state_dict(checkpoint["model"])
-            ema.load_state_dict(checkpoint["ema"])
-            opt.load_state_dict(checkpoint["opt"])
-            
-            # Attempt to parse train_steps from the filename (e.g., '0010000.pt' -> 10000)
-            try:
-                train_steps = int(Path(args.pretrained_path).stem)
-                logger.info(f"Successfully loaded checkpoint. Resuming from step {train_steps}.")
-            except ValueError:
-                logger.info("Successfully loaded checkpoint, but couldn't parse step count from filename.")
-        else:
-            logger.warning(f"Pretrained path '{args.pretrained_path}' does not exist! Starting from scratch.")
-    # ==========================================
+    start_epoch = 0
+    if resume_ckpt_path and os.path.isfile(resume_ckpt_path):
+        train_steps, start_epoch = load_checkpoint(model, ema, opt, resume_ckpt_path, device, logger)
 
     # Setup TensorBoard and sampling diffusion (rank 0 only):
     writer = None
     if rank == 0:
-        tb_dir = f"{experiment_dir}/tensorboard"
+        tb_dir = f"{results_dir}/tensorboard"
         writer = SummaryWriter(log_dir=tb_dir)
         logger.info(f"TensorBoard logs at {tb_dir}")
     if objective == "rfm":
@@ -286,8 +338,8 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    # NEW: Only force-sync the EMA if we ARE NOT resuming from a checkpoint
-    if not (hasattr(args, "pretrained_path") and args.pretrained_path):
+    # Only force-sync the EMA if we are NOT resuming from a checkpoint
+    if not resume_ckpt_path:
         update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     
     model.train()  # important! This enables embedding dropout for classifier-free guidance
@@ -300,7 +352,7 @@ def main(args):
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         batch_iter = tqdm(loader, desc=f"Epoch {epoch}", disable=(rank != 0))
@@ -351,11 +403,30 @@ def main(args):
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "step": train_steps,
+                        "epoch": epoch,
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                dist.barrier()
+
+            # Save an overwritable "last" checkpoint for cheap resume:
+            last_ckpt_every = getattr(args, "last_ckpt_every", None) or args.ckpt_every
+            if last_ckpt_every > 0 and train_steps % last_ckpt_every == 0 and train_steps > 0:
+                if rank == 0:
+                    checkpoint = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "args": args,
+                        "step": train_steps,
+                        "epoch": epoch,
+                    }
+                    checkpoint_path = f"{checkpoint_dir}/last.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    logger.info(f"Saved last checkpoint to {checkpoint_path} (step {train_steps})")
                 dist.barrier()
 
         # Generate and log sample images every sample_every epochs:
@@ -370,7 +441,7 @@ def main(args):
                 )
                 writer.add_image("samples/ema_generations", grid, epoch)
                 writer.flush()
-                samples_dir = f"{experiment_dir}/samples"
+                samples_dir = f"{results_dir}/samples"
                 os.makedirs(samples_dir, exist_ok=True)
                 grid_np = grid.permute(1, 2, 0).mul(255).clamp(0, 255).byte().cpu().numpy()
                 Image.fromarray(grid_np).save(f"{samples_dir}/epoch_{epoch:09d}.jpg")
@@ -400,6 +471,8 @@ def load_config(path: str) -> argparse.Namespace:
 
     cfg.setdefault("objective", "ddpm")
     cfg.setdefault("data_in_memory", False)
+    cfg.setdefault("auto_resume", True)
+    cfg.setdefault("last_ckpt_every", cfg.get("ckpt_every", 25000))
     assert cfg["objective"] in ("ddpm", "rfm"), f"objective must be 'ddpm' or 'rfm', got {cfg['objective']}"
     if cfg["objective"] == "rfm":
         assert "rfm" in cfg, "Config section 'rfm' is required when objective is 'rfm'"
@@ -411,12 +484,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file.")
     parser.add_argument("--local-rank", type=int, default=0) # Dummy arg for Sber server compatibility
-    parser.add_argument("--pretrained_path", type=str, default=None, help="Path to checkpoint to resume from (e.g., /path/to/0050000.pt)")
-    
+    parser.add_argument("--no-auto-resume", action="store_true",
+                        help="Disable automatic resume and start training from scratch.")
+
     cli = parser.parse_args()
     args = load_config(cli.config)
-    
-    args.pretrained_path = cli.pretrained_path
+
+    if cli.no_auto_resume:
+        args.auto_resume = False
     args.config_path = cli.config
-    
+
     main(args)
