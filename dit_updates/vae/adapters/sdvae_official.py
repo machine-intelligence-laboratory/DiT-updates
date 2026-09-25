@@ -55,10 +55,30 @@ class SDVAEOfficialPreprocessor(VAEPreprocessor):
         return 0.5 * image + 0.5
 
 
+class SDVAEReproducePreprocessor(SDVAEOfficialPreprocessor):
+
+    def __init__(self):
+        super(SDVAEReproducePreprocessor, self).__init__()
+
+
 class SDVAEOfficialAdapter(VAEAdapter):
     """
     SDVAE official adapter implementation.
     """
+
+    _IMAGENET_2012_MEAN = [
+        0.8664577007293701,
+        -0.2784937024116516,
+        0.2172907143831253,
+        0.37388119101524353
+    ]
+
+    _IMAGENET_2012_STD = [
+        4.855352878570557,
+        5.320855140686035,
+        3.9364500045776367,
+        3.9874281883239746
+    ]
 
     def __init__(self,
                  name: str = "sdvae_official",
@@ -196,3 +216,22 @@ class SDVAEOfficialAdapter(VAEAdapter):
         info = {}
 
         return images, info
+
+
+class SDVAEReproduceAdapter(SDVAEOfficialAdapter):
+    """
+    SDVAE reproduce adapter implementation.
+    """
+
+    def __init__(self,
+                 name: str = "sdvae_reproduce",
+                 checkpoint: str | Path = "SD-VAE-1.5-reproduce/model.pth",
+                 latent_norm_type: LatentNormalizationType | str = LatentNormalizationType.SCALE,
+                 latent_stats: str | None = "imagenet2012",
+                 device: str = "cuda",
+                 dtype: torch.dtype = torch.float32):
+        super(SDVAEReproduceAdapter, self).__init__(name=name, 
+                                                    checkpoint=checkpoint, 
+                                                    latent_norm_type=latent_norm_type, 
+                                                    latent_stats=latent_stats, 
+                                                    device=device, dtype=dtype)

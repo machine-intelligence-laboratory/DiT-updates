@@ -17,7 +17,8 @@ from dit_updates.vae.adapters.wan_mil import (WANYuv2RgbAdapter,
                                               WANYuv2RgbStage1Adapter,
                                               WANYuv2YuvStage1Adapter,
                                               WANSplitAttn12to4Stage3Adapter)
-from dit_updates.vae.adapters.sdvae_official import SDVAEOfficialAdapter
+from dit_updates.vae.adapters.sdvae_official import (SDVAEOfficialAdapter,
+                                                     SDVAEReproduceAdapter)
 
 
 def resolve_adapter(adapter_name: str, *args, **kwargs) -> VAEAdapter:
@@ -62,5 +63,7 @@ def resolve_adapter(adapter_name: str, *args, **kwargs) -> VAEAdapter:
         return FLUXYuv2RgbAdapter(*args, **kwargs)
     elif adapter_name == "sdvae-official":
         return SDVAEOfficialAdapter(*args, **kwargs)
+    elif adapter_name == "sdvae-reproduce":
+        return SDVAEReproduceAdapter(*args, **kwargs)
     else:
         raise ValueError(f"Invalid adapter name: {adapter_name}")
